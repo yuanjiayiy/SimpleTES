@@ -6,29 +6,38 @@ Main components:
     - SimpleTESEngine: Main evolution engine
     - Node, NodeDatabase: Program node data model and storage
     - Selector: Base class for inspiration selection policies
-"""
-from simpletes.config import EngineConfig
-from simpletes.engine import SimpleTESEngine
-from simpletes.generator import GenerationTask
-from simpletes.evaluator import Evaluator, EvaluatorWorker
-from simpletes.llm import LLMBackend, LLMCallError, LLMClient, create_llm_client
-from simpletes.node import Node, NodeDatabase, Status, extract_code
-from simpletes.policies import Selector, create_selector
 
-__all__ = [
-    "EngineConfig",
-    "SimpleTESEngine",
-    "GenerationTask",
-    "Node",
-    "NodeDatabase",
-    "Status",
-    "extract_code",
-    "Selector",
-    "create_selector",
-    "LLMBackend",
-    "LLMCallError",
-    "LLMClient",
-    "create_llm_client",
-    "Evaluator",
-    "EvaluatorWorker",
-]
+Exports are resolved lazily so that lightweight submodules (e.g.
+``simpletes.construction``, imported by ``sitecustomize`` inside task-local
+eval venvs) do not pull in litellm / rich / the engine.
+"""
+from importlib import import_module
+
+_EXPORTS = {
+    "EngineConfig": "simpletes.config",
+    "SimpleTESEngine": "simpletes.engine",
+    "GenerationTask": "simpletes.generator",
+    "Evaluator": "simpletes.evaluator",
+    "EvaluatorWorker": "simpletes.evaluator",
+    "LLMBackend": "simpletes.llm",
+    "LLMCallError": "simpletes.llm",
+    "LLMClient": "simpletes.llm",
+    "create_llm_client": "simpletes.llm",
+    "Node": "simpletes.node",
+    "NodeDatabase": "simpletes.node",
+    "Status": "simpletes.node",
+    "extract_code": "simpletes.node",
+    "Selector": "simpletes.policies",
+    "create_selector": "simpletes.policies",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module 'simpletes' has no attribute {name!r}")
+    value = getattr(import_module(module), name)
+    globals()[name] = value
+    return value
