@@ -76,6 +76,36 @@ def primary_metric(nodes: list[dict]) -> str | None:
     return max(counts, key=counts.get) if counts else None
 
 
+# Published chain percentiles: mean of each chain's best raw metric over the top R % of
+# chains, keyed by task. Source: SimpleTES paper (arXiv 2604.19341), Supplementary Table 1,
+# gpt-oss-120b before post-training (K=16, L=100, default selector; starting program not stated).
+PERCENTILES = (10, 25, 50, 75)
+TASK_PERCENTILES: dict[str, list[tuple[str, tuple[float, ...]]]] = {
+    "autocorrelation_first": [("SimpleTES paper, Supp. Table 1", (1.505854, 1.506258, 1.506746, 1.507165))],
+    "autocorrelation_second": [("SimpleTES paper, Supp. Table 1", (0.950315, 0.948652, 0.946183, 0.944241))],
+    "autocorrelation_third": [("SimpleTES paper, Supp. Table 1", (1.456845, 1.457179, 1.457945, 1.458700))],
+}
+
+
+def chain_percentiles(chains: dict[int, "ChainSummary"]) -> dict[int, tuple[float, float | None, int]]:
+    """Top-R % chains by best combined_score -> (mean score, mean raw metric, chain count)."""
+
+    ranked = sorted((c for c in chains.values() if c.best is not None), key=lambda c: c.best, reverse=True)
+    out = {}
+    for pct in PERCENTILES:
+        k = max(1, round(len(ranked) * pct / 100)) if ranked else 0
+        top = ranked[:k]
+        if not top:
+            continue
+        metrics = [c.best_metric for c in top if c.best_metric is not None]
+        out[pct] = (
+            sum(c.best for c in top) / k,
+            sum(metrics) / len(metrics) if len(metrics) == k else None,
+            k,
+        )
+    return out
+
+
 def task_name(config: dict) -> str | None:
     """Task key for TASK_REFERENCES: the directory holding the run's evaluator."""
 
@@ -564,6 +594,11 @@ __CSS__
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; margin-bottom: 20px; }
 .config { color: var(--text-secondary); font-size: 12px; margin: -12px 0 20px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .config b { color: var(--text-primary); font-weight: 600; }
+.pct-section { margin-bottom: 20px; }
+.pct-section .title { font-size: 13px; color: var(--text-secondary); margin-bottom: 10px; }
+.pct-section .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.pct-section td.label { font-weight: 600; }
+.pct-section tr.published td { color: var(--text-secondary); }
 </style>
 </head>
 <body>
@@ -592,6 +627,8 @@ __CSS__
       __IMPROVING_CHART__
     </div>
   </div>
+
+  __PERCENTILES__
 
   <div class="table-scroll">
   <table>
@@ -755,6 +792,50 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
     subtitle = (
         f"{len(chains)} chains &middot; {total:,} candidates &middot; seed {fmt(seed, 7)} → best {fmt(best, 7)}"
     )
+
+    # Chain percentiles: this run (score and raw metric) plus any published rows for the task.
+    pct = chain_percentiles(chains)
+    mlabel = esc(metric_key or "metric")
+    pct_rows = []
+    if pct:
+        def spread(values):
+            vals = [v for v in values if v is not None]
+            return f"{abs(vals[0] - vals[-1]):.7f}" if len(vals) == len(values) and vals else "–"
+        metric_vals = [pct[p][1] if p in pct else None for p in PERCENTILES]
+        pct_rows.append(
+            f'<tr><td class="label">This run, {mlabel}</td>'
+            + "".join(f"<td>{fmt(v, 7)}</td>" for v in metric_vals)
+            + f"<td>{spread(metric_vals)}</td></tr>"
+        )
+        for label, values in TASK_PERCENTILES.get(task_name(config), []):
+            pct_rows.append(
+                f'<tr class="published"><td class="label">{esc(label)}, {mlabel}</td>'
+                + "".join(f"<td>{v:.6f}</td>" for v in values)
+                + f"<td>{abs(values[0] - values[-1]):.7f}</td></tr>"
+            )
+        score_vals = [pct[p][0] if p in pct else None for p in PERCENTILES]
+        pct_rows.append(
+            '<tr><td class="label">This run, score</td>'
+            + "".join(f"<td>{fmt(v, 7)}</td>" for v in score_vals)
+            + f"<td>{spread(score_vals)}</td></tr>"
+        )
+        counts = " · ".join(f"top {p} % = {pct[p][2]} chain{'s' if pct[p][2] != 1 else ''}" for p in PERCENTILES if p in pct)
+        percentiles_html = (
+            '<div class="pct-section">\n'
+            '  <div class="title">Chain percentiles: mean of each chain\'s best, over the top R % of chains '
+            '(ranked by score, higher is better)</div>\n'
+            '  <div class="table-scroll"><table>\n'
+            "    <thead><tr><th></th>"
+            + "".join(f"<th>Top {p} %</th>" for p in PERCENTILES)
+            + "<th>Top 10 % to top 75 %</th></tr></thead>\n"
+            "    <tbody>" + "".join(pct_rows) + "</tbody>\n"
+            "  </table></div>\n"
+            f'  <div class="note">{counts}. Published rows use the same statistic over the paper\'s chains; '
+            "the paper does not state their starting program.</div>\n"
+            "</div>"
+        )
+    else:
+        percentiles_html = ""
     return (
         DASHBOARD_TEMPLATE.replace("__CSS__", BASE_CSS)
         .replace("__TITLE__", esc(title))
@@ -782,6 +863,7 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
         )
         .replace("__ROWS__", "\n".join(rows))
         .replace("__METRIC__", esc(metric_key or "metric"))
+        .replace("__PERCENTILES__", percentiles_html)
         .replace("__DB_STATE__", esc(source))
     )
 
@@ -1283,7 +1365,7 @@ def render_chain(
     step_of_id = {nid: step for step, nid in enumerate(history)}  # 0 = the seed
     referenced = {i for row in summary.rows for i in row["inspiration_ids"]}
     node_info = {}
-    for nid in referenced:
+    for nid in sorted(referenced):  # sorted: set order varies between runs (hash seeds)
         node = by_id.get(nid)
         if node is None:
             continue

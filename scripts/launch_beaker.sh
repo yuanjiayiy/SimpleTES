@@ -49,6 +49,8 @@
 #   --gpus N                 GPU request, for GPU tasks (default: 0).
 #   --cluster C              Cluster; repeatable (default: ai2/holmes and ai2/titan).
 #   --priority P             Priority (default: urgent).
+#   --min-runtime DUR        Run at least this long before Beaker may preempt it, e.g. 1h
+#                            (default: 0s, i.e. preemptible at any time; auto-resume stays on).
 #   --workspace WS           Workspace (default: ai2/carriey).
 #   --image IMAGE            Beaker image (default: 01KY5WDGQKDE194RY8PED6MQGE). Tasks that need
 #                            extra toolchains (e.g. cargo for qubit_routing) need an image with them.
@@ -77,6 +79,7 @@ MEMORY="192GiB"
 GPUS=0
 CLUSTERS=""
 PRIORITY="urgent"
+MIN_RUNTIME="0s"
 WORKSPACE="ai2/carriey"
 IMAGE="01KY5WDGQKDE194RY8PED6MQGE"
 WEKA_ROOT="/weka/oe-adapt-default/carriey/simpletes"
@@ -104,6 +107,7 @@ while [ $# -gt 0 ]; do
     --gpus) GPUS="$2"; shift ;;
     --cluster) CLUSTERS="$CLUSTERS $2"; shift ;;
     --priority) PRIORITY="$2"; shift ;;
+    --min-runtime) MIN_RUNTIME="$2"; shift ;;
     --workspace) WORKSPACE="$2"; shift ;;
     --image) IMAGE="$2"; shift ;;
     --weka-root) WEKA_ROOT="${2%/}"; shift ;;
@@ -257,7 +261,7 @@ DATASET="simpletes-$NAME-code-$STAMP"
 SPEC="$STAGE/spec.json"
 NAME="$NAME" EXPERIMENT="$EXPERIMENT" WORKSPACE="$WORKSPACE" ACCOUNT="$ACCOUNT" DATASET="$DATASET" IMAGE="$IMAGE" \
 WEKA_ROOT="$WEKA_ROOT" SECRETS="$SECRETS" CPUS="$CPUS" MEMORY="$MEMORY" GPUS="$GPUS" \
-CLUSTERS="$CLUSTERS" PRIORITY="$PRIORITY" TASK_REL="$TASK_REL" MODEL="$MODEL" python3 - "$SPEC" <<'PY'
+CLUSTERS="$CLUSTERS" PRIORITY="$PRIORITY" MIN_RUNTIME="$MIN_RUNTIME" TASK_REL="$TASK_REL" MODEL="$MODEL" python3 - "$SPEC" <<'PY'
 import json, os, sys
 
 e = os.environ
@@ -286,7 +290,7 @@ spec = {
         ],
         "result": {"path": "/results"},
         "resources": resources,
-        "context": {"priority": e["PRIORITY"], "minRuntime": "0s", "autoResume": True},
+        "context": {"priority": e["PRIORITY"], "minRuntime": e["MIN_RUNTIME"], "autoResume": True},
         "constraints": {"cluster": e["CLUSTERS"].split()},
         "hostNetworking": True,
     }],

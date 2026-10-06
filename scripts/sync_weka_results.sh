@@ -80,7 +80,7 @@ REMOTE="$SRC${SUBPATH:+$SUBPATH/}"
 LOCAL="$DEST${SUBPATH:+/$SUBPATH}"
 [ "$DRYRUN" = 1 ] || mkdir -p "$LOCAL"
 
-ARGS=(--profile "$PROFILE" --endpoint-url "$WEKA_ENDPOINT_URL" s3 sync "$REMOTE" "$LOCAL" --exclude "$MARKER")
+ARGS=(--profile "$PROFILE" --endpoint-url "$WEKA_ENDPOINT_URL" s3 sync "$REMOTE" "$LOCAL" --exclude "$MARKER" --no-progress)
 if [ "$WITH_SNAPSHOTS" = 0 ]; then
   # Later filters win: drop instance-level snapshots, keep the ones inside checkpoints.
   ARGS+=(--exclude "*shared_constructions/*" --include "*db_state_*/shared_constructions/*")
@@ -89,13 +89,33 @@ fi
 [ "$DRYRUN" = 1 ] && ARGS+=(--dryrun)
 
 echo "Syncing $REMOTE -> $LOCAL"
-aws "${ARGS[@]}"
-[ "$DRYRUN" = 1 ] && exit 0
+if [ "$DRYRUN" = 1 ]; then aws "${ARGS[@]}"; exit 0; fi
+# One summary line instead of a line per file; errors still go to stderr.
+aws "${ARGS[@]}" | awk '/^download:/ {d++} /^delete:/ {r++} END {printf "Downloaded %d file(s), deleted %d stale file(s)\n", d, r}'
+# --delete removes a superseded checkpoint's files but leaves its directories behind.
+find "$LOCAL" -mindepth 1 -type d -empty -delete
 echo "Done. Local mirror: $LOCAL ($(du -sh "$LOCAL" | cut -f1))"
 
 if [ "$HTML" = 1 ]; then
-  # Rebuild a run's reports when its checkpoint is newer than the last build.
-  find "$LOCAL" -type d -name 'db_state_*' -prune | sort | while IFS= read -r ckpt; do
+  # Rebuild a run's reports when its checkpoint is newer than the last build. Reports are
+  # per run (instance-*). A run can hold more than one db_state_* (the engine does not
+  # delete the checkpoint it resumed from), and their names carry only the time of day,
+  # so pick each run's newest by completed_evaluations in metadata.json.
+  find "$LOCAL" -type f -name metadata.json -path '*/db_state_*/*' | python3 -c '
+import json, os, sys
+best = {}
+for meta in sys.stdin.read().split():
+    ckpt = os.path.dirname(meta)
+    try:
+        done = int(json.load(open(meta)).get("completed_evaluations", 0))
+    except (OSError, ValueError):
+        continue
+    run = os.path.dirname(ckpt)
+    if run not in best or done > best[run][0]:
+        best[run] = (done, ckpt)
+for _, ckpt in sorted(best.values(), key=lambda b: b[1]):
+    print(ckpt)
+' | while IFS= read -r ckpt; do
     rel="${ckpt#"$DEST"/}"
     out="$HTML_ROOT/$(dirname "$rel")"
     if [ -f "$out/index.html" ] && [ -z "$(find "$ckpt" -maxdepth 1 -name 'nodes.json*' -newer "$out/index.html")" ]; then
