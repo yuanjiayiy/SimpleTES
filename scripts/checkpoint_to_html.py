@@ -61,6 +61,21 @@ TASK_REFERENCES: dict[str, list[tuple[str, float]]] = {
 }
 
 
+# Bookkeeping metrics that are never a task's own objective.
+_NON_OBJECTIVE_METRICS = {"combined_score", "validity", "eval_time", "loss", "n_points", "error"}
+
+
+def primary_metric(nodes: list[dict]) -> str | None:
+    """The task's raw objective metric (e.g. c3, c2): the most common numeric metric key."""
+
+    counts: dict[str, int] = defaultdict(int)
+    for n in nodes[:5000]:
+        for key, value in as_dict(n.get("metrics")).items():
+            if key not in _NON_OBJECTIVE_METRICS and as_float(value) is not None:
+                counts[key] += 1
+    return max(counts, key=counts.get) if counts else None
+
+
 def task_name(config: dict) -> str | None:
     """Task key for TASK_REFERENCES: the directory holding the run's evaluator."""
 
@@ -137,7 +152,7 @@ class ChainSummary:
     improved: int = 0
     labeled: int = 0
     best: float | None = None
-    best_c3: float | None = None
+    best_metric: float | None = None
     last_gain_step: int | None = None
     rows: list[dict] = field(default_factory=list)
 
@@ -176,6 +191,7 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
     root_id = policy.get("root_id") or next((n["id"] for n in nodes if not as_list(n.get("parent_ids"))), None)
     root = by_id.get(root_id, {})
     seed_score = as_float(root.get("score"))
+    metric_key = primary_metric(nodes)
 
     history = {int(c): set(ids) for c, ids in policy.get("chain_history", {}).items()}
     budgets = {int(c): int(v) for c, v in policy.get("prompt_budget", {}).items()}
@@ -201,12 +217,13 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
 
     def base_row(record: dict, chain: int) -> dict:
         gen = int(record["gen_id"]) if record.get("gen_id") not in (None, "") else None
-        parents = as_list(record.get("parent_ids"))
+        # parent_ids holds every inspiration that went into this candidate's prompt.
+        inspirations = as_list(record.get("parent_ids"))
         return {
             "id": record.get("id"),
             "gen_id": gen,
             "step": step_of.get((chain, gen)),
-            "parent_id": parents[0] if parents else None,
+            "inspiration_ids": inspirations,
             "construction_id": record.get("shared_construction_id"),
             "created_at": record.get("created_at"),
         }
@@ -222,13 +239,16 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
         row.update(
             kind="node",
             score=score,
-            c3=as_float(metrics.get("c3")),
+            metric=as_float(metrics.get(metric_key)) if metric_key else None,
             eval_time=as_float(metrics.get("eval_time")),
             status="committed" if n["id"] in history.get(chain, set()) else ("valid" if score is not None else "error"),
             msg=str(error) if error else "",
             metrics=json.dumps(metrics, indent=2, default=str),
             code=n.get("code", ""),
             reflection=n.get("reflection") or "",
+            llm_input=n.get("llm_input") or "",
+            llm_output=n.get("llm_output") or "",
+            token_usage=n.get("token_usage"),
         )
         chains[chain].rows.append(row)
 
@@ -242,7 +262,7 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
         row.update(
             kind="rejected" if is_eval else "gen_failure",
             score=None,
-            c3=as_float(metrics.get("c3")),
+            metric=as_float(metrics.get(metric_key)) if metric_key else None,
             eval_time=as_float(metrics.get("eval_time")),
             status="rejected" if is_eval else "gen_failure",
             msg=str(metrics.get("error") or f.get("reason") or ""),
@@ -254,7 +274,7 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
         )
         chains[chain].rows.append(row)
 
-    parent_score = {n["id"]: as_float(n.get("score")) for n in nodes}
+    score_of = {n["id"]: as_float(n.get("score")) for n in nodes}
     for summary in chains.values():
         summary.rows.sort(key=lambda r: (r["step"] or 0, r["created_at"] or ""))
         running_best = seed_score
@@ -269,7 +289,10 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
                 summary.errors += 1
             else:
                 summary.valid += 1
-            parent = parent_score.get(row["parent_id"])
+            insp_scores = [(score_of.get(i), i) for i in row["inspiration_ids"] if score_of.get(i) is not None]
+            best_insp = max(insp_scores) if insp_scores else (None, None)
+            row["best_inspiration_id"], row["best_inspiration_score"] = best_insp[1], best_insp[0]
+            parent = best_insp[0]
             if row["score"] is not None and parent is not None:
                 summary.labeled += 1
                 delta = row["score"] - parent
@@ -278,7 +301,7 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
             else:
                 row["improvement_label"] = None
             if row["score"] is not None and (summary.best is None or row["score"] > summary.best):
-                summary.best, summary.best_c3 = row["score"], row["c3"]
+                summary.best, summary.best_metric = row["score"], row["metric"]
             if row["score"] is not None and running_best is not None and row["score"] > running_best + 1e-12:
                 running_best = row["score"]
                 summary.last_gain_step = row["step"]
@@ -287,8 +310,8 @@ def build_chains(ckpt: dict) -> tuple[dict[int, ChainSummary], dict]:
         "root_id": root_id,
         "root_code": root.get("code", ""),
         "seed_score": seed_score,
-        "seed_c3": as_float(as_dict(root.get("metrics")).get("c3")),
-        "by_id_code": {n["id"]: n.get("code", "") for n in nodes if n["id"] in set().union(*history.values())} if history else {},
+        "metric_key": metric_key,
+        "by_id": by_id,
     }
     return chains, run_info
 
@@ -581,7 +604,7 @@ __CSS__
         <th title="Candidates that ran and returned a finite combined_score.">Valid %</th>
         <th title="Valid candidates whose score beat their parent's.">Improved %</th>
         <th>Best score</th>
-        <th>Best C3</th>
+        <th>Best __METRIC__</th>
         <th title="Best score minus the seed's score.">Gain over seed</th>
         <th title="Step of the last batch that raised this chain's best score.">Last gain</th>
         <th title="Program crashed or timed out (score -inf).">Errors</th>
@@ -663,7 +686,8 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
     rejected = sum(c.rejects + c.gen_failures for c in chains.values())
     best = as_float(meta.get("best_score"))
     best_node = next((n for n in nodes if n["id"] == meta.get("best_node_id")), None)
-    best_c3 = as_float(as_dict(best_node.get("metrics")).get("c3")) if best_node else None
+    metric_key = run_info.get("metric_key")
+    best_metric = as_float(as_dict(best_node.get("metrics")).get(metric_key)) if best_node and metric_key else None
     times = [t for t in (parse_time(n.get("created_at")) for n in nodes) if t]
     elapsed = (max(times) - min(times)).total_seconds() / 3600 if times else None
 
@@ -671,7 +695,7 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
         ("Candidates", f"{total:,}", False),
         ("Valid rate", f"{100 * valid / total:.1f}%" if total else "–", True),
         ("Best score", fmt(best, 7), False),
-        ("Best C3", fmt(best_c3, 7), False),
+        (f"Best {metric_key or 'metric'}", fmt(best_metric, 7), False),
         ("Gain over seed", f"{best - seed:+.2e}" if best is not None and seed is not None else "–", True),
         ("Seed score", fmt(seed, 7), False),
         ("Rejected", f"{rejected:,}", False),
@@ -719,7 +743,7 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
             f"<td>{valid_cell}</td>"
             f"<td>{improved_cell}</td>"
             f"<td>{fmt(s.best, 7)}</td>"
-            f"<td>{fmt(s.best_c3, 7)}</td>"
+            f"<td>{fmt(s.best_metric, 7)}</td>"
             f"<td>{'–' if gain is None else f'{gain:+.2e}'}</td>"
             f"<td>{s.last_gain_step if s.last_gain_step is not None else '–'}</td>"
             f"<td>{s.errors:,}</td>"
@@ -757,6 +781,7 @@ def render_dashboard(ckpt: dict, chains: dict[int, ChainSummary], run_info: dict
             render_line_chart_svg(new_best_counts, css_class="chart-line-teal", digits=0, dots=False),
         )
         .replace("__ROWS__", "\n".join(rows))
+        .replace("__METRIC__", esc(metric_key or "metric"))
         .replace("__DB_STATE__", esc(source))
     )
 
@@ -798,11 +823,14 @@ thead th:hover { color: var(--text-primary); }
 thead th.sorted::after { content: " " attr(data-dir); color: var(--muted); }
 tbody tr.row { cursor: pointer; }
 tbody tr.row.expanded { background: var(--row-hover); }
+tbody tr.row.committed { background: color-mix(in srgb, var(--good) 9%, transparent); }
 tbody tr.row.committed td:first-child { box-shadow: inset 3px 0 0 var(--good); }
+tbody tr.row.batch-start td { border-top: 2px solid var(--baseline); }
+.rank-1 { color: var(--good); font-weight: 700; }
 td { vertical-align: top; }
 td.msg { color: var(--text-secondary); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 td.mono { color: var(--muted); }
-td.score { white-space: nowrap; }
+td.score, td.nowrap { white-space: nowrap; }
 .reward-bar-bg { background: var(--gridline); border-radius: 3px; height: 6px; width: 80px; display: inline-block; vertical-align: middle; margin-right: 6px; overflow: hidden; }
 .reward-bar-fill { background: var(--series-blue); height: 100%; border-radius: 3px; }
 tr.detail-row td { background: var(--page); padding: 0; }
@@ -816,6 +844,17 @@ tr.detail-row td { background: var(--page); padding: 0; }
 .meta-row { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }
 .meta-row b { color: var(--text-primary); }
 .loading { color: var(--muted); padding: 40px; text-align: center; }
+.insp-list { display: grid; gap: 10px; }
+.insp-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.insp-card.best { box-shadow: inset 3px 0 0 var(--series-blue); }
+.insp-head { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.insp-head b { color: var(--text-primary); }
+.insp-reflection { font-size: 13px; white-space: pre-wrap; margin: 6px 0; color: var(--text-primary); }
+.insp-none { font-size: 12px; color: var(--muted); font-style: italic; }
+details.fold { margin-top: 6px; }
+details.fold > summary { cursor: pointer; font-size: 12px; color: var(--series-blue); font-weight: 600; }
+details.fold .detail-block { margin-top: 6px; }
+.prompt-section > summary .tag { color: var(--muted); font-weight: 400; margin-left: 6px; }
 @media (max-width: 760px) { .detail { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -846,7 +885,7 @@ tr.detail-row td { background: var(--page); padding: 0; }
       <label for="f-status">Status</label>
       <select id="f-status">
         <option value="">all</option>
-        <option value="committed">committed</option>
+        <option value="committed">batch winners only</option>
         <option value="valid">valid</option>
         <option value="error">error</option>
         <option value="rejected">rejected</option>
@@ -872,7 +911,7 @@ tr.detail-row td { background: var(--page); padding: 0; }
     </tbody>
   </table>
   </div>
-  <footer>Generated by scripts/checkpoint_to_html.py from __DB_STATE__ &middot; rows with a green edge are committed winners (one per step)</footer>
+  <footer>Generated by scripts/checkpoint_to_html.py from __DB_STATE__ &middot; tinted rows marked ★ are batch winners: the best of each step's K candidates, appended to the chain</footer>
 </div>
 
 <script>
@@ -901,7 +940,7 @@ function fmt(n, d = 4) {
 function shortId(id) { return id ? String(id).slice(0, 8) : "–"; }
 
 let ROWS = [];
-let CODE_BY_ID = {};
+let NODE_INFO = {};
 let sortKey = "i";
 let sortDir = 1;
 
@@ -911,10 +950,11 @@ const COLUMNS = [
   { key: "id", label: "Node" },
   { key: "score", label: "Score" },
   { key: "status", label: "Status" },
-  { key: "improvement_label", label: "vs parent" },
-  { key: "c3", label: "C3" },
+  { key: "batch_rank", label: "Rank in batch" },
+  { key: "improvement_label", label: "vs best insp." },
+  { key: "metric", label: META.metric_key },
   { key: "eval_time", label: "Eval (s)" },
-  { key: "parent_id", label: "Parent" },
+  { key: "n_inspirations", label: "Inspirations" },
   { key: "msg", label: "Msg" },
 ];
 
@@ -981,7 +1021,7 @@ function filteredSorted() {
     if (status && r.status !== status) return false;
     if (step !== "" && r.step !== Number(step)) return false;
     if (search) {
-      const hay = `${r.msg || ""} ${r.id || ""} ${r.parent_id || ""} ${r.code || ""}`.toLowerCase();
+      const hay = `${r.msg || ""} ${r.id || ""} ${(r.inspiration_ids || []).join(" ")} ${r.code || ""}`.toLowerCase();
       if (!hay.includes(search)) return false;
     }
     return true;
@@ -997,7 +1037,7 @@ function filteredSorted() {
 }
 
 const STATUS_CLASS = { committed: "good", valid: "info", error: "critical", rejected: "warn", gen_failure: "warn" };
-const STATUS_LABEL = { committed: "committed", valid: "valid", error: "error", rejected: "rejected", gen_failure: "no code" };
+const STATUS_LABEL = { committed: "★ batch winner", valid: "valid", error: "error", rejected: "rejected", gen_failure: "no code" };
 
 function statusBadge(r) {
   return `<span class="status ${STATUS_CLASS[r.status] || "muted"}"><span class="dot"></span>${esc(STATUS_LABEL[r.status] || r.status)}</span>`;
@@ -1015,6 +1055,83 @@ function scoreCell(r, lo, hi) {
   return `<span class="reward-bar-bg"><span class="reward-bar-fill" style="width:${pct.toFixed(1)}%"></span></span>${fmt(v, 9)}`;
 }
 
+// Section headers of SimpleTES generation prompts (rpucg and the default template), in order.
+const PROMPT_SECTIONS = [
+  ["Task", "Task:"],
+  ["Generation rules", "Generation instruction (must follow exactly)"],
+  ["Fixed prefix", "EXACT_PREFIX (kept unchanged)"],
+  ["Fixed suffix", "EXACT_SUFFIX (kept unchanged)"],
+  ["Available packages", "Available packages from requirements.txt"],
+  ["Shared construction", "Shared runtime variable available"],
+  ["Reference solutions", "=== REFERENCE SOLUTIONS ==="],
+  ["Inspirations", "In-context inspirations (sorted by score"],
+  ["Inspirations", "[SAMPLED INSPIRATIONS]"],
+  ["Failure patterns", "Common failure patterns to avoid"],
+  ["Failure patterns", "[FAILURE PATTERNS]"],
+  ["Generation strategy", "=== GENERATION STRATEGY ==="],
+  ["Closing request", "Analyze the metrics above"],
+];
+
+function splitPrompt(text) {
+  const found = [];
+  for (const [label, marker] of PROMPT_SECTIONS) {
+    const at = text.indexOf(marker);
+    if (at >= 0 && !found.some((f) => f.at === at)) found.push({ label, at });
+  }
+  found.sort((a, b) => a.at - b.at);
+  if (!found.length) return [{ label: "Prompt", text }];
+  const parts = [];
+  if (found[0].at > 0) parts.push({ label: "Preamble", text: text.slice(0, found[0].at) });
+  found.forEach((f, i) => parts.push({ label: f.label, text: text.slice(f.at, i + 1 < found.length ? found[i + 1].at : text.length) }));
+  return parts;
+}
+
+function inspirationsHTML(r) {
+  const ids = r.inspiration_ids || [];
+  if (!ids.length) return "";
+  // The prompt lists inspirations best first.
+  const items = ids.map((id) => ({ id, info: NODE_INFO[id] || {} }))
+    .sort((a, b) => (b.info.score ?? -Infinity) - (a.info.score ?? -Infinity));
+  const cards = items.map(({ id, info }) => `
+      <div class="insp-card${id === r.best_inspiration_id ? " best" : ""}">
+        <div class="insp-head">
+          <span>Node <b>${esc(shortId(id))}</b></span>
+          <span>Score <b>${fmt(info.score, 9)}</b></span>
+          <span>${info.step === 0 ? "<b>seed program</b>" : info.step != null ? `Committed at step <b>${info.step}</b>` : "not in this chain's history"}</span>
+          ${id === r.best_inspiration_id ? "<span><b>best inspiration</b> (used for “vs best insp.”)</span>" : ""}
+        </div>
+        ${info.reflection
+          ? `<div class="insp-reflection">${esc(info.reflection)}</div>`
+          : `<div class="insp-none">No reflection (only batch winners get one).</div>`}
+        <details class="fold"><summary>Code</summary><div class="detail-block"><pre>${esc(info.code || "(not available)")}</pre></div></details>
+        <details class="fold"><summary>Metrics</summary><div class="detail-block"><pre>${esc(info.metrics || "")}</pre></div></details>
+      </div>`).join("");
+  return `
+    <div class="detail-full">
+      <h4>Inspirations in this candidate's prompt (${ids.length}, best first)</h4>
+      <div class="insp-list">${cards}</div>
+    </div>`;
+}
+
+function promptHTML(r) {
+  if (!r.llm_input && !r.llm_output) return "";
+  const sections = r.llm_input
+    ? splitPrompt(r.llm_input).map((p) => `
+        <details class="fold prompt-section"><summary>${esc(p.label)}<span class="tag">${p.text.length.toLocaleString()} chars</span></summary>
+          <div class="detail-block prose"><pre>${esc(p.text)}</pre></div></details>`).join("")
+    : `<div class="insp-none">Prompt not saved.</div>`;
+  const usage = r.token_usage
+    ? `<span>Tokens <b>${r.token_usage.prompt_tokens ?? "–"} prompt / ${r.token_usage.completion_tokens ?? "–"} completion</b></span>`
+    : "";
+  return `
+    <div class="detail-full">
+      <h4>Prompt sent to the LLM, by section</h4>
+      ${usage ? `<div class="meta-row">${usage}</div>` : ""}
+      ${sections}
+      <details class="fold"><summary>LLM response</summary><div class="detail-block prose"><pre>${esc(r.llm_output || "(empty)")}</pre></div></details>
+    </div>`;
+}
+
 function detailHTML(r) {
   const blocks = [];
   blocks.push(`
@@ -1022,7 +1139,8 @@ function detailHTML(r) {
       <span>Node <b>${esc(r.id || "–")}</b></span>
       <span>Batch <b>${esc(r.gen_id ?? "–")}</b></span>
       <span>Step <b>${esc(r.step ?? "–")}</b></span>
-      <span>Parent <b>${esc(shortId(r.parent_id))}</b>${r.parent_score != null ? ` (${fmt(r.parent_score, 9)})` : ""}</span>
+      <span>Rank in batch <b>${r.batch_rank != null ? `${r.batch_rank} of ${r.batch_size}` : `failed (batch of ${r.batch_size})`}</b>${r.status === "committed" ? " · <b>batch winner</b>, appended to the chain" : ""}</span>
+      <span>Best inspiration <b>${esc(shortId(r.best_inspiration_id))}</b>${r.best_inspiration_score != null ? ` (${fmt(r.best_inspiration_score, 9)})` : ""}</span>
       <span>Warm-start construction <b>${esc(shortId(r.construction_id))}</b></span>
       <span>Created <b>${esc(r.created_at || "–")}</b></span>
     </div>`);
@@ -1036,31 +1154,14 @@ function detailHTML(r) {
   if (r.reflection) {
     blocks.push(`
     <div class="detail-full">
-      <h4>Reflection on this winner (fed into later prompts of this chain)</h4>
+      <h4>Reflection on this winner (shown with it whenever it is a later inspiration)</h4>
       <div class="detail-block prose"><pre>${esc(r.reflection)}</pre></div>
     </div>`);
   }
-  if (r.llm_input || r.llm_output) {
-    blocks.push(`
-    <div>
-      <h4>Generation — input (prompt)</h4>
-      <div class="detail-block prose"><pre>${esc(r.llm_input || "(not saved)")}</pre></div>
-    </div>
-    <div>
-      <h4>Generation — response</h4>
-      <div class="detail-block prose"><pre>${esc(r.llm_output || "(empty)")}</pre></div>
-    </div>`);
-  }
-  const parentCode = CODE_BY_ID[r.parent_id];
-  if (parentCode) {
-    blocks.push(`
-    <div>
-      <h4>Parent code (${esc(shortId(r.parent_id))})</h4>
-      <div class="detail-block"><pre>${esc(parentCode)}</pre></div>
-    </div>`);
-  }
+  blocks.push(inspirationsHTML(r));
+  blocks.push(promptHTML(r));
   blocks.push(`
-    <div class="${parentCode ? "" : "detail-full"}">
+    <div class="detail-full">
       <h4>Candidate code</h4>
       <div class="detail-block"><pre>${esc(r.code) || "(no code extracted)"}</pre></div>
     </div>`);
@@ -1089,18 +1190,23 @@ function renderTable() {
   }
   // Rendering ~1.6k rows with inline detail is fast enough; detail HTML is only built for expanded rows.
   let html = "";
+  const showBatches = sortKey === "i" || sortKey === "step";
+  let prevStep = null;
   for (const r of rows) {
     const isOpen = expanded.has(r.i);
-    html += `<tr class="row${isOpen ? " expanded" : ""}${r.status === "committed" ? " committed" : ""}" data-i="${r.i}">
+    const batchStart = showBatches && prevStep !== null && r.step !== prevStep;
+    prevStep = r.step;
+    html += `<tr class="row${isOpen ? " expanded" : ""}${r.status === "committed" ? " committed" : ""}${batchStart ? " batch-start" : ""}" data-i="${r.i}">
       <td>${r.i}</td>
       <td>${r.step ?? "–"}</td>
       <td class="mono">${esc(shortId(r.id))}</td>
       <td class="score">${scoreCell(r, lo, hi)}</td>
-      <td>${statusBadge(r)}</td>
+      <td class="nowrap">${statusBadge(r)}</td>
+      <td class="nowrap${r.batch_rank === 1 ? " rank-1" : ""}">${r.batch_rank != null ? `${r.batch_rank}/${r.batch_size}` : `–/${r.batch_size}`}</td>
       <td>${improvementBadge(r)}</td>
-      <td>${fmt(r.c3, 9)}</td>
+      <td>${fmt(r.metric, 9)}</td>
       <td>${fmt(r.eval_time, 1)}</td>
-      <td class="mono">${esc(shortId(r.parent_id))}</td>
+      <td class="mono nowrap">${(r.inspiration_ids || []).length} · ${esc(shortId(r.best_inspiration_id))}</td>
       <td class="msg" title="${esc(r.msg || "")}">${esc(r.msg || "")}</td>
     </tr>`;
     if (isOpen) html += `<tr class="detail-row" data-i="${r.i}"><td colspan="${COLUMNS.length}">${detailHTML(r)}</td></tr>`;
@@ -1137,7 +1243,20 @@ function wireControls() {
   try {
     const payload = await decodePayload(DATA_B64);
     ROWS = payload.rows;
-    CODE_BY_ID = payload.code_by_id;
+    NODE_INFO = payload.node_info;
+    for (const r of ROWS) r.n_inspirations = (r.inspiration_ids || []).length;
+    const batches = new Map();
+    for (const r of ROWS) {
+      const key = r.gen_id ?? `step-${r.step}`;
+      if (!batches.has(key)) batches.set(key, []);
+      batches.get(key).push(r);
+    }
+    for (const rows of batches.values()) {
+      // Ties at the top go to the committed candidate, which is the engine's pick.
+      rows.sort((a, b) => ((b.score ?? -Infinity) - (a.score ?? -Infinity))
+        || ((b.status === "committed") - (a.status === "committed")));
+      rows.forEach((r, idx) => { r.batch_rank = r.score == null ? null : idx + 1; r.batch_size = rows.length; });
+    }
   } catch (err) {
     document.getElementById("tbody").innerHTML =
       `<tr><td colspan="${COLUMNS.length}" class="loading">Failed to decode payload: ${esc(err)}. This page needs a browser with native gzip DecompressionStream support (recent Chrome/Edge/Firefox/Safari).</td></tr>`;
@@ -1154,15 +1273,31 @@ function wireControls() {
 """
 
 
-def render_chain(summary: ChainSummary, ckpt: dict, run_info: dict, title: str, source: str) -> str:
+def render_chain(
+    summary: ChainSummary, ckpt: dict, run_info: dict, title: str, source: str, *, omit_llm_io: bool = False
+) -> str:
+    # Every program that appeared as an inspiration in this chain's prompts, with what the
+    # prompt showed for it: score, metrics, reflection and code.
+    by_id = run_info["by_id"]
     history = ckpt["policy"].get("chain_history", {}).get(str(summary.chain), [])
-    score_by_id = {n["id"]: as_float(n.get("score")) for n in ckpt["nodes"]}
-    code_by_id = {nid: run_info["by_id_code"].get(nid, "") for nid in history}
-    if run_info["root_id"]:
-        code_by_id[run_info["root_id"]] = run_info["root_code"]
+    step_of_id = {nid: step for step, nid in enumerate(history)}  # 0 = the seed
+    referenced = {i for row in summary.rows for i in row["inspiration_ids"]}
+    node_info = {}
+    for nid in referenced:
+        node = by_id.get(nid)
+        if node is None:
+            continue
+        node_info[nid] = {
+            "score": as_float(node.get("score")),
+            "step": step_of_id.get(nid),
+            "reflection": node.get("reflection") or "",
+            "metrics": json.dumps(as_dict(node.get("metrics")), indent=2, default=str),
+            "code": node.get("code", ""),
+        }
 
-    for row in summary.rows:
-        row["parent_score"] = score_by_id.get(row["parent_id"])
+    rows = summary.rows
+    if omit_llm_io:
+        rows = [{k: v for k, v in r.items() if k not in ("llm_input", "llm_output")} for r in rows]
 
     # Committed winner score per step, marking steps that set a new chain best.
     winner_points: list[tuple[float, float]] = []
@@ -1184,9 +1319,14 @@ def render_chain(summary: ChainSummary, ckpt: dict, run_info: dict, title: str, 
         marker_note=" (new chain best)",
     )
 
-    payload = json.dumps({"rows": summary.rows, "code_by_id": code_by_id}, separators=(",", ":"), default=str)
+    payload = json.dumps({"rows": rows, "node_info": node_info}, separators=(",", ":"), default=str)
     data_b64 = base64.b64encode(gzip.compress(payload.encode("utf-8"), compresslevel=9, mtime=0)).decode("ascii")
-    meta = {"seed_score": run_info["seed_score"], "steps": summary.steps, "budget": summary.budget}
+    meta = {
+        "seed_score": run_info["seed_score"],
+        "steps": summary.steps,
+        "budget": summary.budget,
+        "metric_key": run_info.get("metric_key") or "metric",
+    }
     gain = summary.best - run_info["seed_score"] if summary.best is not None and run_info["seed_score"] is not None else None
     subtitle = (
         f"{summary.candidates:,} candidates over {summary.steps} steps &middot; best {fmt(summary.best, 9)}"
@@ -1228,6 +1368,11 @@ def main() -> None:
         help="Single reference result (same as --reference LABEL=SCORE with --reference-label)",
     )
     parser.add_argument("--reference-label", default="reference", help="Label for --reference-score")
+    parser.add_argument(
+        "--omit-llm-io",
+        action="store_true",
+        help="Leave saved LLM prompts/responses out of chain pages (keeps them small)",
+    )
     parser.add_argument("--source", default=None, help="Checkpoint location shown in page footers (default: db_state path)")
     args = parser.parse_args()
 
@@ -1259,7 +1404,7 @@ def main() -> None:
         if args.chains is not None and c not in args.chains:
             continue
         path = out / f"chain{c:02d}.html"
-        path.write_text(render_chain(summary, ckpt, run_info, title, source), encoding="utf-8")
+        path.write_text(render_chain(summary, ckpt, run_info, title, source, omit_llm_io=args.omit_llm_io), encoding="utf-8")
         print(f"  wrote {path} ({path.stat().st_size / 1e6:.1f} MB)")
 
 
